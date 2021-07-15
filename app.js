@@ -1,62 +1,117 @@
-var createError = require('http-errors');
-var express = require('express');
-var path = require('path');
-var cookieParser = require('cookie-parser');
-var logger = require('morgan');
-var IgApiClient = require('instagram-private-api');
+const express = require('express');
+const {parse, stringify} = require('envfile');
+const fs = require('fs');
+const { IgApiClient } = require('instagram-private-api');
+require('dotenv').config();
 
-var indexRouter = require('./routes/index');
-var usersRouter = require('./routes/users');
+const app = express();
+const ig = new IgApiClient();
+const port = process.env.PORT || 3000;
 
-var app = express();
-var ig = new IgApiClient();
+const MAX_LIKE_THRESHOLD = 50;
+const DAYS_AGO_THRESHOLD = 7;
+const DAYS_AGO_DATE = new Date();
+DAYS_AGO_DATE.setDate(DAYS_AGO_DATE.getDate() - DAYS_AGO_THRESHOLD);
+const envFilePath = '.env';
+const UTF8 = 'utf8';
+const USERS_TO_LIKE = new Set(fs.readFileSync('./lists/regular.txt', UTF8).split('\n'));
+const MY_USERNAME = process.env.IG_USERNAME;
+const MY_PASSWORD = process.env.IG_PASSWORD;
+const LAST_SEEN_POST = process.env.MOST_RECENT_SEEN_IG_POST_CODE;
 
-// view engine setup
-app.set('views', path.join(__dirname, 'views'));
-// app.set('view engine', 'jade');
+let isFirstPost = true;
 
-app.get('/server', function(req, res) {
-  // Example: Liking my own posts
-  // login, use access token if possible
-  const user = ig.account.login();
-  const feed = ig.feed.user(user.pk);
-  const firstPage = await userFeed.items();
-  // All the feeds are auto-paginated, so you just need to call .items() sequentially to get next page
-  const secondPage = await userFeed.items();
-  await ig.media.like({
-    // Like our first post from first page or first post from second page randomly
-    mediaId: sample([myPostsFirstPage[0].id, myPostsSecondPage[0].id]),
-    moduleInfo: {
-      module_name: 'profile',
-      user_id: user.pk,
-      username: user.username,
-    }
+app.get('/likePosts', async(req, res) => {
+  ig.state.generateDevice(MY_USERNAME);
+  const account = await ig.account.login(MY_USERNAME, MY_PASSWORD);
+  const feed = ig.feed.timeline();
+  let liked = 0, notSeenYet = true, isRecentPost = true;
+  while (liked < MAX_LIKE_THRESHOLD && notSeenYet && isRecentPost) {
+    await feed.items().then(fromFeed => {
+      updateMostRecentSeenPostIfFirst(fromFeed);
+      for (const post of fromFeed) {
+        // debugPost(post);
+        if (!post.user.friendship_status.following) {
+          console.log('encountered an ad \n')
+          continue;
+        } 
+        if (post.has_liked) {
+          console.log('we liked already \n')
+          continue;
+        }
+        if (liked >= MAX_LIKE_THRESHOLD) {
+          break; // need a better way to break, it's still continuing here
+        }
+        if (post.code === LAST_SEEN_POST) {
+          notSeenYet = false;
+          break;
+        }
+        // if (getDate(post.taken_at) < DAYS_AGO_DATE) {
+        //   console.log('old date') 
+        //   console.log(getDate(post.taken_at));
+        //   console.log(DAYS_AGO_DATE)
+        //   isRecentPost = false;
+        //   break;
+        // }
+        // doesn't work because posts returned aren't chrono ordered
+        if (USERS_TO_LIKE.has(post.user.username)) {
+          console.log('liking \n')
+          ig.media.like({
+            mediaId: post.id,
+            moduleInfo: {
+              user_id: account.pk
+            }
+          })
+          liked++;
+        }
+      }
+    });
+  }
+  res.sendStatus(200); 
+});
+
+app.get('/getFollowing', async(req, res) => {
+  const following = await ig.feed.accountFollowing()
+  const items = await following.items();
+  console.log("following count: " + items.length);
+  items.forEach(i => {
+    console.log(i.username);
   });
+  res.sendStatus(200); 
 });
 
-// app.use(logger('dev'));
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-app.use(cookieParser());
-app.use(express.static(path.join(__dirname, 'public')));
-
-app.use('/', indexRouter);
-app.use('/users', usersRouter);
-
-// catch 404 and forward to error handler
-app.use(function(req, res, next) {
-  next(createError(404));
-});
-
-// error handler
-app.use(function(err, req, res, next) {
-  // set locals, only providing error in development
-  res.locals.message = err.message;
-  res.locals.error = req.app.get('env') === 'development' ? err : {};
-
-  // render the error page
-  res.status(err.status || 500);
-  res.render('error');
+function getDate(timestamp) {
+  return new Date(timestamp * 1000);
 }
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function debugPost(post) {
+  console.log("the post code: " + post.code);
+  console.log('the user: ' + post.user.username);
+  console.log('seen?: ' + post.is_seen);
+  console.log('liked?: ' + post.has_liked + '\n');
+}
+
+function basicPromiseHandling(promise) {
+  // could add to promise prototype, or have another wrapper obj for promises
+  return promise
+    .then(obj => console.log("succ: " + JSON.stringify(obj)))
+    .catch(err => console.log("err: " + JSON.stringify(err)));
+}
+
+function updateMostRecentSeenPostIfFirst(fromFeed) {
+  if (fromFeed.length > 0 && isFirstPost) {
+    let data = parse(fs.readFileSync(envFilePath, UTF8));
+    data.MOST_RECENT_SEEN_IG_POST_CODE = fromFeed[0].code;
+    fs.writeFileSync(envFilePath, stringify(data));
+    isFirstPost = false;
+  }
+}
+
+app.set('port', port);
+app.listen(port);
 
 module.exports = app;
